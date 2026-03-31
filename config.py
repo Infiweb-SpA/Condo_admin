@@ -1,53 +1,177 @@
-import os
-from datetime import timedelta
+from flask import Flask, url_for, redirect
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager
+from flask_migrate import Migrate
+from config import config
+from datetime import datetime
+import pytz  # Para manejo de zona horaria
 
-basedir = os.path.abspath(os.path.dirname(__file__))
+db = SQLAlchemy()
+login_manager = LoginManager()
+migrate = Migrate()
 
 
-class Config:
-    """Configuración base para la aplicación"""
+def create_app(config_name='default'):
+    """Factory para crear la aplicación Flask"""
     
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'clave-super-secreta-cambiala-en-produccion'
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or \
-        'sqlite:///' + os.path.join(basedir, 'app/instance/condo_admin.db')
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    app = Flask(__name__)
+    app.config.from_object(config[config_name])
     
-    # Configuración de sesiones
-    PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
-    SESSION_COOKIE_SECURE = False  # True en producción con HTTPS
-    SESSION_COOKIE_HTTPONLY = True
-    SESSION_COOKIE_SAMESITE = 'Lax'
+    # Inicializar extensiones
+    db.init_app(app)
+    login_manager.init_app(app)
+    migrate.init_app(app, db)
     
-    # Configuración de uploads (para futuras imágenes/documentos)
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max
-    UPLOAD_FOLDER = os.path.join(basedir, 'uploads')
+    # Configurar login manager
+    login_manager.login_view = 'auth.login'
+    login_manager.login_message = 'Por favor inicia sesión para acceder a esta página.'
+    login_manager.login_message_category = 'info'
     
-    # Zona horaria
-    TIMEZONE = 'America/Santiago'
+    # ========== FILTROS Y CONTEXT PROCESSORS ==========
+    @app.template_filter('month_name')
+    def month_name_filter(month_number):
+        months = ['', 'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 
+                  'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+        return months[month_number] if 1 <= month_number <= 12 else ''
+
+    @app.template_filter('linebreaks')
+    def linebreaks_filter(text):
+        if not text:
+            return ''
+        return text.replace('\n', '<br>')
+
+    @app.template_filter('localtime')
+    def localtime_filter(utc_dt):
+        if utc_dt is None:
+            return ''
+        tz = pytz.timezone(app.config.get('TIMEZONE', 'UTC'))
+        if utc_dt.tzinfo is None:
+            utc_dt = pytz.utc.localize(utc_dt)
+        local_dt = utc_dt.astimezone(tz)
+        return local_dt.strftime('%d/%m/%Y %H:%M')
+
+    @app.context_processor
+    def inject_now():
+        # Único punto de verdad para la variable 'now' en templates
+        return {'now': datetime.utcnow()}
+    
+    # Registrar blueprints
+    from app.routes import auth, dashboard, roles, bookings, parking, financials, announcements, contacts, rules
+    from app.routes.paqueteria import bp as paqueteria_bp
+    from app.routes.comprobante import bp as comprobante_bp
+    
+    app.register_blueprint(paqueteria_bp)
+    app.register_blueprint(comprobante_bp)
+    app.register_blueprint(auth.bp)
+    app.register_blueprint(dashboard.bp)
+    app.register_blueprint(roles.bp)
+    app.register_blueprint(bookings.bp)
+    app.register_blueprint(parking.bp)
+    app.register_blueprint(financials.bp)
+    app.register_blueprint(announcements.bp)
+    app.register_blueprint(contacts.bp)
+    app.register_blueprint(rules.bp)
+
+    # SOLUCIÓN ERROR 500: Ruta raíz redirige al login
+    @app.route('/')
+    def index():
+        return redirect(url_for('auth.login'))
+
+    # SOLUCIÓN RATE LIMIT: Se desactiva la inicialización automática en el arranque.
+    # Para inicializar la DB, usa el comando: flask init-db
+    """
+    with app.app_context():
+        db.create_all()
+        init_default_data()
+    """
+    
+    return app
 
 
-class DevelopmentConfig(Config):
-    """Configuración para desarrollo"""
-    DEBUG = True
-    SQLALCHEMY_ECHO = True  # Muestra queries SQL en consola
-
-
-class ProductionConfig(Config):
-    """Configuración para producción"""
-    DEBUG = False
-    SQLALCHEMY_ECHO = False
-    SESSION_COOKIE_SECURE = True
-
-
-class TestingConfig(Config):
-    """Configuración para tests"""
-    TESTING = True
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
-
-
-config = {
-    'development': DevelopmentConfig,
-    'production': ProductionConfig,
-    'testing': TestingConfig,
-    'default': DevelopmentConfig
-}
+def init_default_data():
+    """Inicializa roles y usuario admin por defecto"""
+    from app.models.user import Role, User, Module, ModulePermission
+    
+    # Crear módulos si no existen
+    modules_data = [
+        {'name': 'roles', 'display_name': 'Gestión de Roles y Permisos'},
+        {'name': 'bookings', 'display_name': 'Reserva de Espacios Comunes'},
+        {'name': 'parking', 'display_name': 'Estado de Estacionamientos'},
+        {'name': 'financials', 'display_name': 'Cuentas y Servicios Pagados'},
+        {'name': 'announcements', 'display_name': 'Comunicados Oficiales'},
+    ]
+    
+    for mod_data in modules_data:
+        if not Module.query.filter_by(name=mod_data['name']).first():
+            module = Module(**mod_data)
+            db.session.add(module)
+    
+    db.session.commit()
+    
+    # Crear roles por defecto
+    roles_data = [
+        {
+            'name': 'super_admin',
+            'display_name': 'Super Administrador',
+            'description': 'Acceso completo a todos los módulos',
+            'permissions': {'roles': 2, 'bookings': 2, 'parking': 2, 'financials': 2, 'announcements': 2}
+        },
+        {
+            'name': 'administrator',
+            'display_name': 'Administrador',
+            'description': 'Gestión operativa del condominio',
+            'permissions': {'roles': 1, 'bookings': 2, 'parking': 2, 'financials': 2, 'announcements': 2}
+        },
+        {
+            'name': 'security_guard',
+            'display_name': 'Guardia de Seguridad',
+            'description': 'Control de accesos y estacionamientos',
+            'permissions': {'roles': 0, 'bookings': 1, 'parking': 2, 'financials': 0, 'announcements': 1}
+        },
+        {
+            'name': 'board_member',
+            'display_name': 'Miembro de Directiva',
+            'description': 'Supervisión y aprobaciones',
+            'permissions': {'roles': 1, 'bookings': 2, 'parking': 1, 'financials': 2, 'announcements': 2}
+        },
+        {
+            'name': 'resident',
+            'display_name': 'Residente',
+            'description': 'Acceso básico para residentes',
+            'permissions': {'roles': 0, 'bookings': 2, 'parking': 1, 'financials': 1, 'announcements': 1}
+        }
+    ]
+    
+    for role_data in roles_data:
+        if not Role.query.filter_by(name=role_data['name']).first():
+            permissions = role_data.pop('permissions')
+            role = Role(**role_data)
+            db.session.add(role)
+            db.session.flush()
+            
+            for module_name, level in permissions.items():
+                module = Module.query.filter_by(name=module_name).first()
+                if module:
+                    perm = ModulePermission(
+                        role_id=role.id,
+                        module_id=module.id,
+                        permission_level=level
+                    )
+                    db.session.add(perm)
+    
+    db.session.commit()
+    
+    # Crear usuario admin
+    if not User.query.filter_by(email='admin@condoadmin.com').first():
+        admin_role = Role.query.filter_by(name='super_admin').first()
+        admin_user = User(
+            email='admin@condoadmin.com',
+            username='admin',
+            first_name='Administrador',
+            last_name='Sistema',
+            role_id=admin_role.id,
+            is_active=True
+        )
+        admin_user.set_password('admin123')
+        db.session.add(admin_user)
+        db.session.commit()
